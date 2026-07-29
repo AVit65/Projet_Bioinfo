@@ -1,0 +1,15 @@
+Status	preprocessed/alignments/SRR11780569.bam	preprocessed/alignments/SRR11780570.bam	preprocessed/alignments/SRR11780571.bam	preprocessed/alignments/SRR11780572.bam	preprocessed/alignments/SRR11780573.bam
+Assigned	15511176	14182518	16401339	16302409	14748989
+Unassigned_Unmapped	11256454	8066162	10044471	11513450	10949899
+Unassigned_Read_Type	0	0	0	0	0
+Unassigned_Singleton	0	0	0	0	0
+Unassigned_MappingQuality	0	0	0	0	0
+Unassigned_Chimera	0	0	0	0	0
+Unassigned_FragmentLength	0	0	0	0	0
+Unassigned_Duplicate	0	0	0	0	0
+Unassigned_MultiMapping	2491134	1970374	2463170	3004535	7195949
+Unassigned_Secondary	0	0	0	0	0
+Unassigned_NonSplit	0	0	0	0	0
+Unassigned_NoFeatures	2682491	2617784	3370854	3622928	3253992
+Unassigned_Overlapping_Length	0	0	0	0	0
+Unassigned_Ambiguity	1852439	1685036	1976680	1961291	1805957

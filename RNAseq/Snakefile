@@ -1,0 +1,98 @@
+import glob
+import re
+
+# =========================
+# PATHS
+# =========================
+FASTQ_DIR = "raw_data/fastqc"
+REF_GTF = "reference/gencode.v49.basic.annotation.gtf"
+INDEX = "index/grch38/genome"
+
+# =========================
+# AUTO-DETECTION SAMPLES
+# =========================
+files = glob.glob(f"{FASTQ_DIR}/*_1.fastq.gz")
+
+SAMPLES = sorted([
+    re.sub(r"_1.fastq.gz", "", f.split("/")[-1])
+    for f in files
+])
+
+print("Detected samples:", SAMPLES)
+
+
+# =========================
+# FINAL TARGETS
+# =========================
+rule all:
+    input:
+        "results/counts/counts_matrix.txt",
+        "results/multiqc/multiqc_report.html"
+
+
+# =========================
+# FASTQC
+# =========================
+rule fastqc:
+    input:
+        fq1 = FASTQ_DIR + "/{sample}_1.fastq.gz",
+        fq2 = FASTQ_DIR + "/{sample}_2.fastq.gz"
+    output:
+        "results/fastqc/{sample}_1_fastqc.html",
+        "results/fastqc/{sample}_2_fastqc.html"
+    shell:
+        """
+        fastqc {input.fq1} {input.fq2} -o results/fastqc/
+        """
+
+
+# =========================
+# ALIGNMENT HISAT2
+# =========================
+rule hisat2:
+    input:
+        fq1 = FASTQ_DIR + "/{sample}_1.fastq.gz",
+        fq2 = FASTQ_DIR + "/{sample}_2.fastq.gz"
+    output:
+        bam = "preprocessed/alignments/{sample}.bam"
+    threads: 4
+    shell:
+        """
+        hisat2 -p 4 -x {INDEX} \
+        -1 {input.fq1} -2 {input.fq2} \
+        | samtools sort -@ 4 -o {output.bam}
+        """
+
+
+# =========================
+# FEATURECOUNTS (GLOBAL MATRIX)
+# =========================
+rule featurecounts:
+    input:
+        bam=expand("preprocessed/alignments/{sample}.bam", sample=SAMPLES),
+        gtf="reference/gencode.v49.basic.annotation.gtf"
+    output:
+        "results/counts/counts_matrix.txt"
+    threads: 4
+    shell:
+        """
+        featureCounts -T {threads} -p --countReadPairs \
+        -a {input.gtf} \
+        -o {output} \
+        {input.bam}
+        """
+
+
+# =========================
+# MULTIQC
+# =========================
+rule multiqc:
+    input:
+        expand("results/fastqc/{sample}_1_fastqc.html", sample=SAMPLES),
+        expand("results/fastqc/{sample}_2_fastqc.html", sample=SAMPLES)
+    output:
+        "results/multiqc/multiqc_report.html"
+    shell:
+        """
+        multiqc results/fastqc/ -o results/multiqc/
+        """

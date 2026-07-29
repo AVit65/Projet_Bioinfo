@@ -1,0 +1,1089 @@
+---
+title: "RNA-seq analysis (DESeq2) - PRJNA632023"
+author: "RNA-seq pipeline"
+date: "`r Sys.Date()`"
+always_allow_html: true
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+output_file: "../Results/DESeq2_rapport/rapport_final.html"
+---
+
+
+# Introduction et objectifs de l'étude
+
+Le transcriptome représente l’ensemble des ARN exprimés dans une cellule à un moment donné et constitue un indicateur clé de l’activité biologique. L’analyse RNA-seq permet de quantifier ces niveaux d’expression à grande échelle et d’identifier des gènes différentiellement exprimés entre conditions biologiques.
+
+Dans cette étude, nous analysons les données RNA-seq du projet **PRJNA632023**, portant sur des neurones dérivés d’iPSC humaines (hiPSC-neurons). L’objectif principal est d’identifier les altérations transcriptionnelles associées à la condition **PMS (Phelan-McDermid Syndrome)** par rapport aux contrôles (CTRL), à différents stades de différenciation neuronale.
+
+---
+
+# Description des échantillons
+
+Les données proviennent de la base SRA et incluent des échantillons hiPSC-neurons issus de plusieurs individus répartis entre conditions **CTRL** et **PMS**, et mesurés à différents timepoints (par exemple 4 semaines, 6 semaines, 8 semaines).
+
+Chaque échantillon correspond à un run SRA (SRR), et est associé à des métadonnées incluant :
+
+- condition biologique (CTRL vs PMS)
+- sexe du donneur
+- temps de différenciation (timepoint)
+- identifiant individuel (réplicats biologiques)
+
+Ces informations permettent de modéliser correctement la variabilité inter-individuelle et les effets de développement neuronal.
+
+---
+
+# Workflow de l'analyse
+
+Ce document décrit une analyse RNA-seq complète à partir de matrices de comptage issues de featureCounts.  
+Nous allons :
+
+- importer et fusionner les matrices de comptage issues de featuresCounts
+- intégrer les métadonnées expérimentales (condition, sexe,timepoint, individu)
+- effectuer un contrôle qualité des données
+- identifier les gènes différentiellement exprimé entre PMS et CTRL
+- effectuer une analyse différentielle avec DESeq2
+- générer des visualisations (PCA, heatmap, volcano plot)
+- exporter les résultats
+
+---
+
+# Chargement des packages
+
+```{r message=FALSE, warning=FALSE}
+library(DESeq2)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(knitr)
+library(biomaRt)
+library(kableExtra)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+```
+
+---
+
+# Paramètres d'entrée
+
+On définit ici les chemins vers les données.
+
+```{r}
+counts_dir <- "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/results/counts"
+metadata_file <- "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/métadonnées/SraRunTable.csv"
+```
+
+---
+
+# Chargement et fusion des matrices de counts
+
+## Objectif
+
+Chaque fichier correspond à une matrice contenant les résultats de comptage obtenu par batch contenant plusieurs échantillons chacun.  
+On doit donc :
+
+- lire les différents fichiers
+- nettoyer les noms de colonnes
+- extraire uniquement les colonnes SRR (samples)
+- fusionner toutes les matrices par gène
+
+---
+
+## Lecture des fichiers
+
+```{r}
+files <- list.files(
+  counts_dir,
+  pattern = "counts_matrix.*\\.txt$",
+  full.names = TRUE
+)
+
+cat(length(files), "count matrices found\n")
+```
+
+---
+
+## Import et nettoyage
+
+```{r}
+count_list <- lapply(files, function(f){
+
+  cat("Reading:", basename(f), "\n")
+
+  df <- read.delim(
+    f,
+    comment.char = "#",
+    sep = "\t",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  # Nettoyage des noms de colonnes
+  colnames(df) <- trimws(colnames(df))
+  colnames(df) <- gsub("preprocessed/alignments/", "", colnames(df))
+  colnames(df) <- gsub("\\.bam$", "", colnames(df))
+
+  # garder uniquement colonnes SRR
+  sample_cols <- grep("^SRR", colnames(df))
+
+  df <- df[, c("Geneid", colnames(df)[sample_cols]), drop = FALSE]
+
+  df
+})
+```
+
+---
+
+## Fusion des matrices
+
+```{r}
+merged_counts <- Reduce(function(x, y){
+  merge(x, y, by = "Geneid", all = TRUE)
+}, count_list)
+
+rownames(merged_counts) <- merged_counts$Geneid
+merged_counts$Geneid <- NULL
+
+# remplacer NA par 0
+merged_counts[is.na(merged_counts)] <- 0
+
+# suppression doublons éventuels
+merged_counts <- merged_counts[, !duplicated(colnames(merged_counts))]
+
+count_matrix <- as.matrix(merged_counts)
+mode(count_matrix) <- "integer"
+
+cat(nrow(count_matrix), "genes x", ncol(count_matrix), "samples\n")
+```
+
+## Création d'un dictionnaire ENSG <-> Symbol_ID
+
+```{r}
+# Matrice -> data.frame
+count_df <- as.data.frame(count_matrix)
+
+# Récupération des IDs Ensembl
+genes_full <- rownames(count_df)
+genes_clean <- sub("\\..*", "", genes_full)
+
+# Connexion à Ensembl
+ensembl <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl"
+)
+
+# Annotation
+annot <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = genes_clean,
+  mart = ensembl
+)
+
+# Ajouter les symbol
+symbols <- annot$hgnc_symbol[
+  match(genes_clean, annot$ensembl_gene_id)
+]
+
+# Les symboles vides deviennent NA
+symbols[symbols == ""] <- NA
+
+# Garder l'ENSG quand il n'y a pas de symbole
+new_names <- ifelse(
+  is.na(symbols),
+  rownames(count_df),
+  symbols
+)
+
+# Dictionnaire : nom = ENSG, valeur = symbole
+ensg2symbol <- setNames(
+  annot$hgnc_symbol,
+  annot$ensembl_gene_id
+)
+```
+
+---
+
+# Métadonnées
+
+Les métadonnées expérimentales constituent une étape fondamentale dans toute analyse RNA-seq, car elles permettent de relier les données d’expression génique aux conditions biologiques et aux facteurs techniques associés à chaque échantillon.
+
+Dans une analyse différentielle, ces informations sont utilisées pour :
+
+- définir les groupes comparés (ex : CTRL vs PMS)
+- contrôler les facteurs confondants (sexe, batch, individu)
+- modéliser correctement la variabilité inter-échantillons
+
+Une mauvaise intégration des métadonnées peut conduire à des résultats biaisés ou à de faux positifs.
+
+## 5.1 Chargement
+
+Le fichier de métadonnées contient une ligne par échantillon (run SRA), avec des informations biologiques et techniques issues du SRA Run Table.
+
+
+```{r}
+metadata <- read.csv(metadata_file, check.names = FALSE)
+```
+
+---
+
+## 5.2 Filtrage et alignement
+
+On garde uniquement les échantillons présents dans les counts.
+Il est également important de réordonner les métadonnées pour qu'elles correspondent exactement à l’ordre des colonnes de la matrice :
+
+```{r}
+metadata <- metadata[metadata$Run %in% colnames(count_matrix), ]
+
+metadata <- metadata[match(colnames(count_matrix), metadata$Run), ]
+```
+
+Avant de définir le modèle statistique pour l’analyse différentielle des données RNA-seq, il est essentiel de vérifier la structure du jeu de données et la répartition des échantillons selon les principaux facteurs expérimentaux. Cette étape permet d’identifier d’éventuels déséquilibres, corrélations entre variables ou confusions potentielles qui pourraient biaiser les résultats d’expression différentielle.
+
+Dans ce contexte, on peut examiner la distribution des échantillons selon le type cellulaire, le temps de différenciation, le groupe (CTRL vs PMS), le sexe et les individus. Ces vérifications permettent d’évaluer la complexité du design expérimental et de guider le choix des covariables à inclure dans les modèles statistiques.
+
+```{r}
+tab <- table(metadata$cell_type, metadata$timepoint)
+
+kable(tab, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center" ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white")
+```
+La répartition des échantillons montre que les hiPSC-NPCs sont comme attendus uniquement présentes au temps 0 semaine (n = 39), tandis que les hiPSC-neurones sont répartis entre les temps 4 semaines (n = 15), 6 semaines (n = 14) et 8 semaines (n = 11). Cette structure expérimentale permet d'étudier les variations transcriptionnelles associées à la maturation neuronale entre 4w, 6w et 8w. En revanche, les effets du type cellulaire (NPCs versus neurones) et du temps de différenciation (0 semaine versus temps ultérieurs) sont confondus, puisqu'aucun échantillon NPC n'est disponible aux temps neuronaux et aucun échantillon neurone n'est disponible à 0 semaine. Les différences observées entre NPCs et neurones devront donc être interprétées comme le résultat combiné du changement de type cellulaire et de l'avancement de la différenciation.
+
+```{r}
+tab <- table(metadata$individual_id, metadata$timepoint)
+
+kable(tab, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center"
+  ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white")
+```
+L'examen de la répartition des échantillons par individu et par temps de différenciation révèle un design expérimental déséquilibré. Plusieurs individus sont suivis à différents stades de la différenciation, mais seuls quelques donneurs sont représentés à l'ensemble des temps étudiés. Certains individus sont présents exclusivement au stade NPC, tandis que d'autres contribuent à plusieurs temps neuronaux. Cette structure suggère une variabilité interindividuelle potentiellement importante qui devra être prise en compte dans les analyses d'expression différentielle. L'inclusion de l'identifiant du donneur comme facteur de blocage ou effet de sujet pourra être envisagée afin de limiter l'impact de cette variabilité biologique sur les résultats.
+
+```{r}
+tab <- table(metadata$individual_id, metadata$`group/diagnosis`)
+
+kable(tab, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center"
+  ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white")
+```
+La répartition des échantillons selon les individus et le groupe expérimental montre que chaque donneur appartient exclusivement à l'un des deux groupes étudiés (CTRL ou PMS), conformément au design de l'étude. Le jeu de données comprend 46 échantillons CTRL issus de six individus et 33 échantillons PMS issus de sept individus. Le nombre d'échantillons par individu est toutefois très variable, certains donneurs contribuant à un nombre important de mesures alors que d'autres ne sont représentés que par un ou quelques échantillons. Cette structure souligne l'importance de considérer la variabilité interindividuelle dans les analyses statistiques et de vérifier l'absence de déséquilibre majeur entre groupes pour les autres facteurs expérimentaux, notamment le temps de différenciation et le sexe.
+
+```{r}
+tab <- table(metadata$gender, metadata$`group/diagnosis`)
+
+kable(tab, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center"
+  ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white")
+```
+L’analyse de la distribution du sexe révèle une légère hétérogénéité entre les groupes CTRL et PMS, avec une proportion relativement plus faible de mâles dans le groupe PMS.
+
+Étant donné que le sexe peut influencer l’expression génique, cette variable constitue un facteur de confusion potentiel et devra être considérée comme covariable dans les analyses statistiques afin de limiter les biais.
+
+```{r}
+tab <- table(metadata$timepoint, metadata$`group/diagnosis`)
+
+kable(tab, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center"
+  ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white")
+```
+
+La répartition des échantillons selon le temps de différenciation et le groupe expérimental montre que les groupes CTRL et PMS sont représentés à l'ensemble des temps étudiés, ce qui permet de distinguer statistiquement les effets du groupe et du temps de différenciation. La distribution est particulièrement équilibrée au temps 0 (20 CTRL et 19 PMS), tandis qu'un déséquilibre modéré apparaît aux stades neuronaux avec un nombre plus élevé d'échantillons CTRL que PMS. Le nombre total d'échantillons diminue progressivement au cours de la différenciation dans les deux groupes, ce qui pourrait réduire la puissance statistique des analyses réalisées aux temps les plus tardifs, notamment à 8 semaines. Dans l'ensemble, aucun déséquilibre majeur susceptible d'empêcher l'estimation de l'effet du groupe n'est observé, bien que la taille d'échantillon plus faible dans le groupe PMS doive être prise en compte lors de l'interprétation des résultats.
+
+
+```{r}
+tab <- table(metadata$gender, metadata$timepoint)
+
+kable(tab, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center"
+  ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white")
+```
+
+```{r}
+summary(metadata$rin)
+```
+
+```{r}
+boxplot(rin ~ `group/diagnosis`, data = metadata)
+```
+
+```{r}
+boxplot(rin ~ timepoint, data = metadata)
+```
+
+---
+
+library(dplyr)
+
+metadata %>%
+  group_by(`group/diagnosis`) %>%
+  summarise(
+    n = n(),
+    mean = mean(rin, na.rm = TRUE),
+    sd = sd(rin, na.rm = TRUE),
+    median = median(rin, na.rm = TRUE),
+    min = min(rin, na.rm = TRUE),
+    max = max(rin, na.rm = TRUE)
+  )
+  
+
+metadata %>%
+  group_by(timepoint) %>%
+  summarise(
+    n = n(),
+    mean = mean(rin, na.rm = TRUE),
+    sd = sd(rin, na.rm = TRUE),
+    median = median(rin, na.rm = TRUE),
+    min = min(rin, na.rm = TRUE),
+    max = max(rin, na.rm = TRUE)
+  )
+
+
+
+## 5.3 Construction du colData
+
+```{r}
+colData <- data.frame(
+  row.names = metadata$Run,
+  condition = factor(metadata$`group/diagnosis`),
+  timepoint = factor(metadata$timepoint),
+  individual = factor(metadata$individual_id),
+  sex = factor(metadata$gender),
+  rin = as.numeric(metadata$rin)
+
+)
+```
+
+---
+
+# Analyse exploratoire des données de séquençage
+
+Avant toute analyse d'expression différentielle, il est essentiel d'évaluer la qualité des données RNA-seq afin d'identifier d'éventuels biais techniques ou échantillons aberrants susceptibles d'influencer les résultats biologiques. Le contrôle qualité permet notamment de vérifier que la profondeur de séquençage est suffisante et comparable entre les échantillons, que le nombre de gènes détectés est cohérent avec le type d'échantillon étudié, et d'identifier d'éventuels outliers résultant de problèmes expérimentaux ou de séquençage. Ces vérifications constituent une étape indispensable pour garantir la fiabilité des analyses statistiques réalisées par la suite.
+
+Dans cette étude le profil d'expression génique a été obtenu par séquençage RNA-seq à haut débit sur réalisé sur une plateforme de type Illumina HiSeq 2500. Cette technologie permet de quantifier l'expression de l'ensemble des gènes transcrits dans une cellule ou un tissu en séquençant les molécules d'ARN converties en ADN complémentaire. Les données générées sous forme de comptages de lectures (read counts) permettent ensuite d'identifier les gènes différentiellement exprimés entre les groupes étudiés. Dans le cadre d'une expérience de RNA-seq en vrac sur des cellules humaines, une profondeur de séquençage d'environ 20 à 30 millions de lectures par échantillon est généralement recommandée pour obtenir une quantification robuste de l'expression génique et assurer une puissance statistique suffisante pour les analyses d'expression différentielle.
+
+## Analyse de la qualité des données
+
+
+### Total reads par sample
+
+Dans un premier temps on peut évaluer la qualité des données par l'examen du nombre total de read (library size) obtenues pour chaque échantillon. 
+
+```{r}
+library_size <- colSums(count_matrix)
+
+library_size_df <- data.frame(
+  sample = names(library_size),
+  total_reads = library_size
+)
+
+library_size_df <- library_size_df %>%
+  arrange(total_reads)   
+
+head(library_size_df)
+```
+
+```{r fig.width=12, fig.height=5}
+
+p1 <- ggplot(library_size_df, aes(y = total_reads)) +
+  geom_boxplot(fill = "steelblue") +
+  ylab("Total reads per sample") +
+  xlab("") +
+  theme_minimal()
+
+p2 <- ggplot(library_size_df, aes(x = reorder(sample, total_reads), y = total_reads)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  ylab("Total reads") +
+  xlab("Samples")
+
+p1 + p2 + plot_layout(widths = c(1, 3))
+```
+
+La majorité des échantillons présentent entre environ 8 et 30 millions de lectures, indiquant une profondeur de séquençage globalement satisfaisante pour l'analyse de l'expression génique.
+
+Toutefois, un échantillon (SRR11780582) se distingue nettement des autres avec seulement 52 561 lectures, soit plusieurs centaines de fois moins que les autres bibliothèques. Cette valeur extrêmement faible suggère un problème technique lors de la préparation de la bibliothèque, du séquençage ou du traitement des données.
+
+
+### Total gènes detectés par sample
+
+Le nombre de gènes détectés par échantillon a également été calculé comme le nombre de gènes présentant au moins un read aligné.
+
+```{r} 
+
+detected_genes <- colSums(count_matrix > 0)
+
+detected_genes_df <- data.frame(
+  sample = names(detected_genes),
+  total_genes = detected_genes
+)
+
+detected_genes_df <- detected_genes_df %>%
+  arrange(total_genes)  
+
+head(detected_genes_df)
+
+
+```
+
+```{r fig.width=12, fig.height=5}
+
+p1 <- ggplot(detected_genes_df, aes(y = total_genes)) +
+  geom_boxplot(fill = "steelblue") +
+  ylab("Total genes per sample") +
+  xlab("") +
+  theme_minimal()
+
+p2 <- ggplot(detected_genes_df, aes(x = reorder(sample, total_genes), y = total_genes)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  ylab("Total genes") +
+  xlab("Samples")
+
+p1 + p2 + plot_layout(widths = c(1, 3))
+```
+
+La majorité des échantillons montrent entre 33 000 et 40 000 gènes détectés en utilisant l’annotation GENCODE v49 basic, ce qui est cohérent avec des données RNA-seq humaines de bonne qualité.
+
+L'échantillon SRR11780582 présente de nouveau des valeurs atypiques avec seulement 10 307 gènes détectés, soit environ trois fois moins que les autres échantillons. Cette diminution importante du nombre de gènes exprimés est cohérente avec la très faible profondeur de séquençage observée précédemment.
+
+### Visualisation des informations sur les échantillons outliers
+
+```{r}
+outlier = metadata %>%
+  filter(Run == "SRR11780582")
+
+kable(outlier, format = "html") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    position = "center"
+  ) %>%
+  row_spec(0,
+           bold = TRUE,
+           background = "#2C3E50",
+           color = "white") %>%
+  scroll_box(width = "100%")
+
+```
+
+### Conclusion
+
+L'analyse des métriques de contrôle qualité met en évidence une qualité globale satisfaisante pour la majorité des échantillons de l'étude. Les distributions du nombre total de lectures et du nombre de gènes détectés sont relativement homogènes entre échantillons, ce qui suggère une bonne reproductibilité technique.
+
+En revanche, l'échantillon SRR11780582 apparaît comme un outlier majeur, caractérisé à la fois par une profondeur de séquençage extrêmement faible et un nombre réduit de gènes détectés. Cet échantillon est susceptible d'introduire du bruit dans les analyses statistiques ultérieures et devrait être exclu des étapes de normalisation, d'analyse exploratoire et d'identification des gènes différentiellement exprimés
+
+## PCA exploratoire
+
+Compte tenu de la structure complexe du jeu de données mise en évidence précédemment, une autre étape d’analyse exploratoire multivariée est nécessaire avant de procéder aux analyses d’expression différentielle.
+
+En particulier, la présence de plusieurs facteurs expérimentaux fortement structurés (type cellulaire, temps de différenciation, individu, groupe et sexe), ainsi que les potentielles corrélations entre ces variables, rend indispensable une évaluation globale des principales sources de variation du transcriptome.
+
+Dans ce contexte, une analyse en composantes principales (PCA) peut être réalisée en amont des tests différentiels. Cette approche permet de :
+
+- visualiser les relations globales entre échantillons,
+- identifier les principaux axes de variation des données,
+- détecter d’éventuels effets de lot ou structures cachées,
+- et évaluer l’impact relatif des variables expérimentales sur la variance totale
+
+La PCA est réalisée à partir des données transformées par la méthode Variance Stabilizing Transformation (VST) de DESeq2. Cette transformation réduit la dépendance entre la variance et le niveau moyen d'expression des gènes, permettant ainsi une représentation plus fidèle des distances entre échantillons. Les premières composantes principales résument les principales sources de variation présentes dans le jeu de données et permettent d'évaluer l'influence relative des facteurs biologiques et techniques.
+
+
+```{r} 
+
+count_matrix <- count_matrix[, colnames(count_matrix) != "SRR11780582"]
+
+colData <- colData[rownames(colData) != "SRR11780582",]
+``` 
+
+
+```{r} 
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = colData,
+  design = ~  sex + timepoint + condition
+)
+
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ]
+```
+
+
+
+
+```{r} 
+vsd <- vst(dds, blind = TRUE)
+
+```
+
+### Condition et timepoint
+
+```{r} 
+
+pcaData <- plotPCA(vsd,
+                   intgroup = c("condition","timepoint"),
+                   returnData = TRUE)
+
+percentVar <- round(100 * attr(pcaData,"percentVar"))
+
+ggplot(pcaData,
+  aes(PC1,
+      PC2,
+      color = condition,
+      shape = timepoint)) +
+  geom_point(size = 4) +
+  xlab( paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  theme_minimal() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+  
+``` 
+
+L’analyse en composantes principales (PCA) révèle une forte structuration des échantillons principalement selon le temps. Le premier axe (PC1) met en évidence une séparation nette entre les échantillons initiaux (0 semaine) et ceux des temps plus tardifs (4 à 8 semaines), suggérant que la dynamique temporelle constitue la principale source de variance du transcriptome.
+
+En revanche, le second axe (PC2) ne permet pas de discriminer clairement les groupes selon la condition ou le temps. Il reflète plutôt une variabilité secondaire entre échantillons, potentiellement liée à une hétérogénéité biologique intra-groupe ou à des effets combinés entre condition et évolution temporelle.
+
+On observe néanmoins une légère tendance à une sur-représentation des échantillons PMS dans la partie supérieure du graphique (PC2 positif), suggérant une possible divergence partielle de ce groupe, bien que celle-ci ne soit pas suffisamment marquée pour constituer une séparation nette.
+
+
+### Condition et genre
+
+
+```{r}   
+pcaData <- plotPCA(vsd,
+                   intgroup = c("condition","sex"),
+                   returnData = TRUE)
+
+percentVar <- round( 100 * attr(pcaData,"percentVar"))
+
+ggplot(pcaData,
+  aes(PC1,
+      PC2,
+      color = sex,
+      shape = condition)) +
+  geom_point(size = 4) +
+  theme_minimal() +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+``` 
+
+La coloration de la PCA selon le sexe et la condition met en évidence une tendance partielle associée au sexe, avec une projection des échantillons masculins plutôt positive et des échantillons féminins plutôt négative sur cet axe. Cette structuration reste toutefois imparfaite, les deux groupes présentant un chevauchement important dans l’espace PCA. La tendance associée au sexe sur ce second axe apparait plus franche que celle associée au phénotype.
+
+
+### Individu et timepoint
+
+```{r} 
+pcaData <- plotPCA(vsd,
+                   intgroup = c("individual", "timepoint"),
+                   returnData = TRUE)
+
+percentVar <- round( 100 * attr(pcaData,"percentVar"))
+
+ggplot( pcaData,
+  aes( PC1,
+       PC2,
+       color = individual,
+       shape = timepoint)) +
+  geom_point(size = 4) +
+  theme_minimal() +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+```
+Lorsque la PCA est colorée selon l’individu et le timepoint, on observe, pour plusieurs individus, des triplets distincts d'échantillons issus des temps 4w,6w et 8w proche au sein d'un même triplet mais éloignés d'un triplet à l'autre. L'individu E reflète très bien cet exemple, avec l'observation de trois triplets. 
+
+L’article associé à ces données indique que plusieurs échantillons peuvent provenir de différents clones au sein d’un même individu. Dans ce contexte, cette structuration pourrait refléter une hétérogénéité intra-individuelle, compatible avec l’existence de plusieurs clones présentant des signatures transcriptomiques distinctes. Ainsi, la variabilité observée suggère une composante intra-individuelle importante en plus de la variabilité interindividuelle potentiellement due à la présence de plusieurs clones par individus.
+
+### Séparation
+
+Les signatures transcriptionnelles étant fortement différenciées entre les états NPC et neurones, une seconde série d’analyses en composantes principales sera réalisée séparément pour chacun de ces deux états afin de mieux explorer la variabilité associée aux autres facteurs biologiques.
+
+Par la suite, les analyses d’expression différentielle avec DESeq2 seront également effectuées de manière stratifiée par état (NPC et neurones). Cela permettra de comparer les conditions PMS et contrôle dans un contexte cellulaire homogène, en limitant les effets de confusion liés aux différences globales de programmes transcriptionnels entre NPC et neurones. 
+
+```{r} 
+vsd_nsc <- vsd[, vsd$timepoint == "0"]
+vsd_neurons <- vsd[, vsd$timepoint %in% c("4w","6w","8w")]
+```
+
+
+```{r fig.width=12, fig.height=5} 
+
+
+pcaData <- plotPCA(vsd_nsc,
+                   intgroup = c("condition","sex"),
+                   returnData = TRUE)
+
+percentVar <- round(100 * attr(pcaData,"percentVar"))
+
+p1 = ggplot(pcaData,
+  aes(PC1,
+      PC2,
+      color = condition,
+      shape = sex)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal()
+
+
+pcaData <- plotPCA(vsd_nsc,
+                   intgroup = c("individual"),
+                   returnData = TRUE)
+
+percentVar <- round( 100 * attr(pcaData,"percentVar"))
+
+p2 = ggplot(pcaData,
+    aes(PC1,
+        PC2,
+        color = individual)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")+
+  theme_minimal()
+
+p1 + p2 + plot_layout(widths = c(1, 1))
+
+  
+``` 
+lorsque l’analyse est restreinte aux seuls échantillons NPC, la variance expliquée par les premières composantes diminue nettement : PC1 n’explique plus qu’environ 22 % de la variance, tandis que PC2 en explique environ 13 %. 
+
+Concernant le phénotype, un chevauchement important est observé entre les conditions PMS et contrôle. Les échantillons contrôle apparaissent relativement dispersés dans l’espace PCA, tandis que les échantillons PMS montrent une distribution plus structurée, avec une tendance à se projeter vers des valeurs positives de PC2 et négatives de PC1, bien que cette tendance reste partielle et marquée par un chevauchement avec les contrôles.
+
+En ce qui concerne le sexe des individus, on observe également un recouvrement important entre échantillons masculins et féminins. Néanmoins, les échantillons féminins tendent globalement à se projeter vers des valeurs plus élevées sur les deux premières composantes principales de l'analyse.
+
+Enfin, dans cet espace réduit, les échantillons issus d’un même individu ne forment pas systématiquement des groupes compacts : la plupart des individus apparaissent partiellement mélangés avec les autres, bien que certains sous-ensembles provenant d’un même individu tendent à être plus proches les uns des autres, suggérant une certaine structuration intra-individuelle mais non systématique qui pourrait à nouveau être lié à la présence de différents clones pour certains individus.
+
+
+```{r fig.width=12, fig.height=5} 
+
+pcaData <- plotPCA(
+  vsd_neurons,
+  intgroup = c("condition","sex"),
+  returnData = TRUE
+)
+
+percentVar <- round(100 * attr(pcaData,"percentVar"))
+
+
+p1 = ggplot(pcaData,
+  aes(
+    PC1,
+    PC2,
+    color = condition,
+    shape = sex
+  )
+) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")+
+  theme_minimal()
+
+pcaData <- plotPCA(vsd_neurons,
+                   intgroup = c("individual","timepoint"),
+                   returnData = TRUE)
+
+percentVar <- round(100 * attr(pcaData,"percentVar"))
+
+p2 = ggplot(pcaData,
+  aes(PC1,
+      PC2,
+      color = individual,
+      shape = timepoint)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")+
+  theme_minimal()
+
+p1 + p2 + plot_layout(widths = c(1, 1))
+```
+Lorsque l’analyse est restreinte aux seuls échantillons neuronaux, la variance expliquée par les premières composantes diminue également tout en restant plus élevée que celle observée au stade NPC : la PC1 n’explique plus qu’environ 33 % de la variance, tandis que PC2 en explique environ 18 %. 
+
+Sur le plan du phénotype, on observe là encore un chevauchement relativement élevé entre les échantillons PMS et les échantillons contrôles. Les échantillons PMS sont distribués sur l’ensemble de l’axe PC1, avec toutefois une tendance globale à se situer davantage dans la partie inférieure de l’espace PCA. À l’inverse, les échantillons contrôles apparaissent plus dispersés, occupant l’ensemble de l’espace sans structuration nette.
+
+Concernant le sexe des individus, la séparation apparaît légèrement plus marquée que pour le phénotype. Les échantillons masculins tendent à se répartir vers différentes régions de l’espace PCA, notamment en haut, en bas et à droite, tandis que les échantillons féminins sont plutôt localisés à gauche ou au centre de l'espace. 
+
+Enfin, l’analyse en fonction des individus et du temps de différenciation met en évidence des  regroupements d'échantillons très proches appartenant aux mêmes individus mais issus de temps différents. On observe ainsi, pour plusieurs individus, des ensembles cohérents d’échantillons 4w, 6w et 8w formant des sous-groupes compacts dans l’espace PCA. Cette structure suggère une forte composante intra-individuelle, potentiellement compatible avec une origine clonale distincte, et indiquant une variabilité intra-individuelle  supérieure à la variabilité liée au temps de différenciation.
+
+
+# Analyse de l'expression différentielle
+
+L’analyse différentielle d’expression a été réalisée avec le package DESeq2, qui repose sur un modèle statistique adapté aux données de comptage issues du RNA-seq. Ces données suivent typiquement une distribution de type binomiale négative, permettant de modéliser à la fois la variabilité biologique entre échantillons et la dispersion propre aux mesures de séquençage.
+
+DESeq2 estime d’abord des facteurs de normalisation (size factors) afin de corriger les différences de profondeur de séquençage entre échantillons. Ensuite, il estime la dispersion pour chaque gène, en combinant une estimation gene-wise et une régression globale afin de stabiliser les estimations pour les gènes faiblement exprimés. Enfin, un modèle linéaire généralisé est ajusté pour chaque gène afin de tester l’effet des conditions expérimentales.
+
+Les tests d’hypothèse sont basés sur des Wald tests, et les p-values sont ajustées pour les tests multiples selon la méthode de Benjamini-Hochberg afin de contrôler le taux de faux positifs (FDR).
+
+## Création du modèle
+
+L’identification des gènes différentiellement exprimés est réalisée à l’aide de modèles statistiques adaptés aux données de comptage RNA-seq. La définition du design expérimental constitue une étape essentielle, car elle permet de tester l’effet de la condition biologique tout en prenant en compte les principales sources de variabilité mises en évidence lors de l’analyse exploratoire.
+
+Le design expérimental a donc été défini en tenant compte des principales sources de variabilité identifiées lors de l’analyse exploratoire, notamment la condition biologique (CTRL vs PMS), le sexe et le temps de différenciation.
+
+Deux modèles distincts ont été utilisés :
+
+- pour les NPC (timepoint 0) : ~ sex + condition
+- pour les neurones (4w, 6w, 8w) : ~ sex + condition + timepoint
+
+Ce choix permet d’estimer l’effet de la condition tout en ajustant pour le sexe et, dans le cas des neurones, pour la dynamique de différenciation.
+
+Comme observé lors de la phase exploiratoire, chaque individu appartient exclusivement à une seule condition (CTRL ou PMS). Par conséquent, l’effet “individu” est parfaitement confondu avec la condition et ne peut pas être inclus comme facteur explicite dans le modèle statistique sans rendre l’effet de condition non estimable. Ainsi, la variabilité interindividuelle est intégrée implicitement dans la variance résiduelle du modèle, mais elle ne peut pas être séparée de l’effet de la condition. Cette contrainte du design doit être prise en compte dans l’interprétation des résultats, car une partie de l’effet détecté peut refléter à la fois la condition biologique et le background génétique des donneurs.
+
+
+```{r}
+colData_npc <- subset(colData, timepoint == "0")
+counts_npc <- count_matrix[, rownames(colData_npc)]
+
+dds_npc <- DESeqDataSetFromMatrix(
+  countData = counts_npc,
+  colData = colData_npc,
+  design = ~ sex + condition
+)
+```
+
+
+```{r}
+colData_neurons <- subset(colData, timepoint %in% c("4w", "6w", "8w"))
+counts_neurons <- count_matrix[, rownames(colData_neurons)]
+
+dds_neurons <- DESeqDataSetFromMatrix(
+  countData = counts_neurons,
+  colData = colData_neurons,
+  design = ~ sex + condition + timepoint
+)
+```
+
+---
+
+## Filtrage des gènes peu exprimés
+
+Avant l’analyse différentielle, un filtrage des gènes faiblement exprimés est appliqué afin de réduire le bruit statistique et d’améliorer la puissance des tests. Les gènes présentant une expression trop faible ou trop sporadique entre échantillons sont susceptibles d’introduire de la variabilité non informative et d’augmenter la charge de tests multiples.
+
+Seuls les gènes exprimés avec au moins 10 lectures dans un minimum de 3 échantillons sont conservés pour l’analyse.
+
+```{r}
+keep_npc <- rowSums(counts(dds_npc) >= 10) >= 3
+dds_npc <- dds_npc[keep, ]
+
+keep_neurons <- rowSums(counts(dds_neurons) >= 10) >= 3
+dds_neurons <- dds_neurons[keep, ]
+```
+
+---
+
+## Transformation des données
+
+Afin de permettre une exploration visuelle des données et de réduire l’hétéroscédasticité inhérente aux données de comptage, une transformation de type Variance Stabilizing Transformation (VST) est appliquée aux matrices normalisées.
+
+Cette transformation rend les distances entre échantillons plus interprétables et est utilisée pour les analyses exploratoires telles que la PCA ou les représentations globales de structure des données.
+
+```{r}
+vsd_npc <- vst(dds_npc, blind = TRUE)
+vsd_neurons <- vst(dds_neurons, blind = TRUE)
+
+```
+
+##  Analyse de l'expression différentielle
+
+L’analyse différentielle est ensuite réalisée en ajustant les modèles statistiques définis précédemment sur les données normalisées et filtrées. Cette étape permet d’estimer, pour chaque gène, l’effet de la condition biologique en contrôlant les covariables incluses dans le design.
+
+Les coefficients de régression associés à chaque variable sont estimés pour l’ensemble des gènes, et des tests statistiques sont effectués afin d’identifier les gènes dont l’expression est significativement associée à la condition ou au temps de différenciation.
+
+```{r}
+dds_npc <- DESeq(dds_npc)
+dds_neurons <- DESeq(dds_neurons)
+
+```
+
+---
+
+# Résultats de l'analyse de l'expression différentiels
+
+```{r}
+res_npc <- results(dds_npc, contrast = c("condition", "PMS", "CTRL"))
+res_npc <- res_npc[order(res_npc$padj), ]
+genes_clean <- sub("\\..*", "", rownames(res_npc))
+res_npc$symbol <- unname(ensg2symbol[genes_clean])
+
+head(res_npc)
+```
+
+```{r}
+res_neurons <- results(dds_neurons, contrast = c("condition", "PMS", "CTRL"))
+res_neurons <- res_neurons[order(res_neurons$padj), ]
+genes_clean <- sub("\\..*", "", rownames(res_neurons))
+res_neurons$symbol <- unname(ensg2symbol[genes_clean])
+head(res_neurons)
+```
+
+
+
+
+---
+
+## Heatmap des gènes significatifs
+
+### Sélection des top gènes
+
+```{r}
+topgenes <- rownames(res_neurons)[order(res_neurons$padj)][1:50]
+mat_neurons <- assay(vsd_neurons)[topgenes, ]
+mat_neurons <- mat_neurons - rowMeans(mat_neurons)
+```
+
+---
+
+### Heatmap
+
+```{r fig.width=12, fig.height=10}
+pheatmap(mat_neurons, annotation_col = colData)
+dev.copy(png, "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/results/DESeq2_heatmap/heatmap_top50_neurons.png")
+dev.off()
+
+
+```
+
+---
+
+## Volcano plot
+
+```{r fig.width=12, fig.height=7}
+
+
+# Nombre de gènes à annoter
+n_labels <- 15
+
+# ---------- NPC ----------
+volcano_npc <- as.data.frame(res_npc)
+
+volcano_npc$significant <- ifelse(
+  is.na(volcano_npc$padj),
+  FALSE,
+  volcano_npc$padj < 0.05
+)
+
+top_npc <- volcano_npc |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::arrange(padj) |>
+  head(n_labels)
+
+p_npc <- ggplot(
+  volcano_npc,
+  aes(x = log2FoldChange, y = -log10(padj))
+) +
+  geom_point(aes(color = significant), alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  geom_text_repel(
+    data = top_npc,
+    aes(label = symbol),
+    max.overlaps = Inf
+  ) +
+  labs(
+    title = "NPCs : PMS vs CTRL",
+    subtitle = "Differential expression analysis (DESeq2)",
+    x = "Log2 Fold Change",
+    y = expression(-log[10](adjusted~p~value)),
+    color = "padj < 0.05"
+  ) +
+  theme_bw()
+
+# ---------- Neurons ----------
+volcano_neurons <- as.data.frame(res_neurons)
+
+volcano_neurons$significant <- ifelse(
+  is.na(volcano_neurons$padj),
+  FALSE,
+  volcano_neurons$padj < 0.05
+)
+
+top_neurons <- volcano_neurons |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::arrange(padj) |>
+  head(n_labels)
+
+p_neurons <- ggplot(
+  volcano_neurons,
+  aes(x = log2FoldChange, y = -log10(padj))
+) +
+  geom_point(aes(color = significant), alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  geom_text_repel(
+    data = top_neurons,
+    aes(label = symbol),
+    max.overlaps = Inf
+  ) +
+  labs(
+    title = "Neurons : PMS vs CTRL",
+    subtitle = "Differential expression analysis (DESeq2)",
+    x = "Log2 Fold Change",
+    y = expression(-log[10](adjusted~p~value)),
+    color = "padj < 0.05"
+  ) +
+  theme_bw()
+
+# Affichage côte à côte
+p_npc + p_neurons
+```
+
+## Export des résultats
+
+```{r}
+write.csv(as.data.frame(res_npc), "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/results/DESeq2_results/DESeq2_results_npc.csv")
+
+sig_npc <- subset(as.data.frame(res_npc), padj < 0.05)
+write.csv(sig_npc, "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/results/DESeq2_significant_genes/DESeq2_significant_genes_npc.csv")
+
+cat(nrow(sig_npc), "significant genes\n")
+```
+
+```{r}
+write.csv(as.data.frame(res_neurons), "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/results/DESeq2_results/DESeq2_results_neurons.csv")
+
+sig_neurons <- subset(as.data.frame(res_neurons), padj < 0.05)
+write.csv(sig_neurons, "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/results/DESeq2_significant_genes/DESeq2_significant_genes_neurons.csv")
+
+cat(nrow(sig_neurons), "significant genes\n")
+```
+
+
+# Etude d'enrichissement fonctionnel
+## Au stade NPC
+
+```{r}
+geneList_npc <- res_npc$log2FoldChange
+names(geneList_npc) <- res_npc$symbol
+
+geneList_npc <- sort(geneList_npc, decreasing = TRUE)
+
+gsea_go_npc <- gseGO(
+  geneList_npc,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  keyType = "SYMBOL"
+)
+
+gsea_df_npc <- as.data.frame(gsea_go_npc)
+
+head(
+  gsea_df_npc[, c("Description", "NES", "p.adjust")],
+  20
+)
+
+```
+
+```{r fig.width=12, fig.height=7}
+
+dotplot(gsea_go_npc, showCategory = 20)
+emapplot(pairwise_termsim(gsea_go_npc))
+```
+
+## Au stade neuronal
+
+```{r}
+geneList_neurons <- res_neurons$log2FoldChange
+names(geneList_neurons) <- res_neurons$symbol
+
+geneList_neurons <- sort(geneList_neurons, decreasing = TRUE)
+
+gsea_go_neurons <- gseGO(
+  geneList_neurons,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  keyType = "SYMBOL"
+)
+
+gsea_df_neurons <- as.data.frame(gsea_go_neurons)
+
+head(
+  gsea_df_neurons[, c("Description", "NES", "p.adjust")],
+  20
+)
+
+```
+
+
+```{r fig.width=12, fig.height=7}
+
+dotplot(gsea_go_neurons, showCategory = 20)
+emapplot(pairwise_termsim(gsea_go_neurons))
+```
+
+# Session info
+
+```{r}
+writeLines(capture.output(sessionInfo()), "C:/Users/33647/Desktop/Bioinfo Training/RNAseq/script/sessionInfo.txt")
+```
+
+---
+
+# Conclusion
+
+
