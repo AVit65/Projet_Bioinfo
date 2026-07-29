@@ -1,0 +1,136 @@
+configfile: "config.yaml"
+
+TRIOS = list(config["trios"].keys())
+CHROMS = list(range(1,23)) + ["X"]
+
+rule all:
+    input:
+        "results/tables/variants.tab.tsv"
+
+
+rule concat:
+    input:
+        lambda wc: expand(
+            "raw_data/VCF/{folder}/{prefix}.chr{chr}.vcf.gz",
+            folder=config["trios"][wc.trio]["folder"],
+            prefix=config["trios"][wc.trio]["prefix"],
+            chr=CHROMS
+        )
+    output:
+        vcf="results/VCF/trios/{trio}.vcf.gz",
+        idx="results/VCF/trios/{trio}.vcf.gz.tbi"
+    conda:
+        "envs/variant_tools.yaml"
+    shell:
+        """
+        bcftools concat {input} -Oz -o {output.vcf}
+        tabix -p vcf {output.vcf}
+        """
+
+rule merge:
+    input:
+        vcf=expand("results/VCF/trios/{trio}.vcf.gz", trio=TRIOS),
+    output:
+        "results/VCF/merged/all_trios.vcf.gz"
+    conda:
+        "envs/variant_tools.yaml"
+    shell:
+        "bcftools merge {input.vcf} -Oz -o {output}"
+
+rule index_all:
+    input:
+        "results/VCF/merged/all_trios.vcf.gz"
+    output:
+        "results/VCF/merged/all_trios.vcf.gz.tbi"
+    conda:
+        "envs/variant_tools.yaml"
+    shell:
+        "tabix -p vcf {input}"
+
+
+rule vep:
+    input:
+        vcf="results/VCF/merged/all_trios.vcf.gz",
+        index="results/VCF/merged/all_trios.vcf.gz.tbi"
+
+    output:
+        "results/VEP/variants.vep.vcf.gz"
+
+    threads:
+        config["threads"]
+
+    conda:
+        "envs/vep.yaml"
+
+    shell:
+        """
+        vep \
+            -i {input.vcf} \
+            -o {output} \
+            --vcf \
+            --compress_output bgzip \
+            --cache \
+            --offline \
+            --assembly {config[assembly]} \
+            --everything \
+            --fork {threads}\
+            --dir_plugins /home/avitrac65/variant_annotation/tools/loftee\
+            --plugin LoF,loftee_path:/home/avitrac65/variant_annotation/tools/loftee,\
+human_ancestor_fa:/home/avitrac65/variant_annotation/raw_data/Loftee_data/human_ancestor.fa.gz,\
+gerp_bigwig:/home/avitrac65/variant_annotation/tools/loftee/gerp_conservation_scores.homo_sapiens.GRCh38.bw
+        """
+
+
+rule slivar:
+    input:
+        "results/VEP/variants.vep.vcf.gz"
+
+    output:
+        "results/slivar/variants.slivar.vcf"
+
+    conda:
+        "envs/variant_tools.yaml"
+
+    shell:
+        """
+        slivar expr \
+            --vcf {input} \
+            --ped {config[ped]} \
+            --trio "denovo:kid.het && mom.hom_ref && dad.hom_ref" \
+            --pass-only \
+            > {output}
+        """
+
+
+rule query:
+    input:
+        "results/slivar/variants.slivar.vcf"
+
+    output:
+        temp("results/temp/variants_samples.txt")
+
+    conda:
+        "envs/variant_tools.yaml"
+
+    shell:
+        """
+        bcftools query \
+            -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%INFO/denovo\t%INFO/CSQ[\t%SAMPLE=%GT]\n' \
+            {input} \
+            > {output}
+        """
+
+rule split_samples:
+    input:
+        "results/temp/variants_samples.txt"
+
+    output:
+        "results/tables/variants.tab.tsv"
+
+    conda:
+        "envs/variant_tools.yaml"
+
+    shell:
+        """
+        awk -f scripts/formatage.awk {input} > {output}
+        """

@@ -1,0 +1,13 @@
+assembly: GRCh38
+threads: 4
+cache: ~/.vep
+ped: raw_data/ped/ped.txt
+
+trios:
+  trio1:
+    folder: Trio1
+    prefix: NA12878_1463_CEUTrio
+
+  trio2:
+    folder: Trio2
+    prefix: NA19240_Y117_YRITrio
